@@ -1,0 +1,73 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+def dp_sgd_jl(x_train, y_train, num_iterations, learning_rates, noise_scale, batch_size, clipping_norms, num_projections):
+    
+    # Define the model
+    model = nn.Linear(x_train.shape[1], 1)
+    
+    # Define the loss function
+    criterion = nn.BCEWithLogitsLoss()
+    
+    # Define the optimizer
+    optimizer = optim.SGD(model.parameters(), lr=learning_rates[0])
+    
+    # Define the clipping thresholds
+    clip_thresholds = np.minimum(clipping_norms, np.sqrt(2 * np.log(1.25 / 0.1) / batch_size))
+    
+    # Define the JL projections
+    jl_projections = np.random.normal(size=(x_train.shape[1], num_projections))
+    
+    # Define the privacy budget
+    epsilon = noise_scale * np.sqrt(num_iterations * batch_size) / clip_thresholds.min()
+    
+    for t in range(num_iterations):
+        
+        # Sample a mini-batch
+        indices = np.random.choice(x_train.shape[0], batch_size, replace=False)
+        x_batch = torch.tensor(x_train[indices], dtype=torch.float32)
+        y_batch = torch.tensor(y_train[indices], dtype=torch.float32)
+        
+        # Zero out the gradients
+        optimizer.zero_grad()
+        
+        # Compute the gradients
+        f_batch = criterion(model(x_batch).squeeze(), y_batch)
+        f_batch.backward()
+        
+        # Estimate the per-sample gradients
+        per_sample_gradients = []
+        for j in range(num_projections):
+            v_j = torch.tensor(jl_projections[:, j], dtype=torch.float32)
+            p_j = torch.mm(model.weight.grad.data.T, v_j)
+            per_sample_gradients.append(p_j.unsqueeze(1))
+        per_sample_gradients = torch.cat(per_sample_gradients, dim=1)
+        per_sample_norms = torch.norm(per_sample_gradients, dim=0)
+        per_sample_norms_estimate = per_sample_norms + noise_scale * torch.randn_like(per_sample_norms)
+        
+        # Clip the per-sample gradients
+        clipped_gradients = torch.clamp(per_sample_gradients, -clip_thresholds.min(), clip_thresholds.min())
+        
+        # Compute the average of clipped gradients and add noise
+        average_clipped_gradients = clipped_gradients.mean(dim=1)
+        noisy_average_clipped_gradients = average_clipped_gradients + noise_scale * clip_thresholds.min() * torch.randn_like(average_clipped_gradients)
+        
+        # Update the model
+        optimizer.param_groups[0]['lr'] = learning_rates[t]
+        optimizer.step(noisy_average_clipped_gradients.view(-1, 1))
+        
+        # Project the model weights
+        model.weight.data = torch.mm(jl_projections, torch.mm(jl_projections.T, model.weight.data))
+        
+        # Clip the model weights
+        model.weight.data = torch.clamp(model.weight.data, -clip_thresholds.max(), clip_thresholds.max())
+        
+        # Print the current iteration and privacy loss
+        if t % 10 == 0:
+            privacy_loss = 2 * num_iterations * batch_size * epsilon
+            print(f"Iteration {t}: privacy loss = {privacy_loss}")
+    
+    # Return the final model weights
+    return model.weight.data.numpy()
